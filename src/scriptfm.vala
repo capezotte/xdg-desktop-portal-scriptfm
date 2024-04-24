@@ -2,75 +2,130 @@ string to_one(bool x) {
 	return x ? "1" : "";
 }
 
+const uint OK = 0;
+const uint FAIL = 2;
+const uint ENDED = 3;
+
 [DBus(name = "org.freedesktop.impl.portal.Request")]
 public class ScriptRequest : Object {
 
 	private weak DBusConnection conn;
+	protected Cancellable cancellable;
 	private uint id;
+	private string[] argv;
 
-	public ScriptRequest(ObjectPath h, DBusConnection conn) throws IOError {
+	public ScriptRequest(string[] argv, ObjectPath h, DBusConnection conn) throws IOError {
 		this.conn = conn;
 		this.id = this.conn.register_object(h, this);
+		this.cancellable = new Cancellable();
+		this.argv = argv;
+
+		this.cancellable.connect(() => {
+			this.conn.unregister_object(this.id);
+		});
 	}
 
-	public void close() throws DBusError, IOError {
-		this.conn.unregister_object(this.id);
-	}
-}
-
-[DBus(name = "org.freedesktop.impl.portal.FileChooser")]
-public class ScriptFileManager : Object {
-
-	private const uint OK = 0;
-	private const uint FAIL = 2;
-	private const uint ENDED = 3;
-	private DBusConnection conn;
-
-	struct ScriptEnv {
-		bool multiple;
-		bool directory;
-		string? path;
-	}
-
-	public ScriptFileManager(DBusConnection conn) {
-		this.conn = conn;
-	}
-
-	Array<string>? launch_script(bool save, ScriptEnv env) {
-		Bytes data;
-		Subprocess p;
+	protected async Bytes? run() throws Error {
+		Bytes ret = new Bytes(null);
+		bool comm = false;
+		Subprocess proc;
 
 		try {
-			p = new Subprocess(SubprocessFlags.STDOUT_PIPE,
-					    "env",
-					    "SFM_MULTIPLE=" + to_one(env.multiple),
-					    "SFM_DIRECTORY=" + to_one(env.directory),
-					    "SFM_SAVE=" + to_one(save),
-					    "SFM_PATH=" + (env.path ?? ""),
-					    "xdp-sfm", null);
-			p.communicate(null, null, out data, null);
+			proc = new Subprocess.newv(this.argv, SubprocessFlags.STDOUT_PIPE);
+			this.cancellable.connect(() => { proc.force_exit(); });
 		} catch (Error e) {
-			stderr.printf("setting up the script failed: %s\n", e.message);
+			stderr.printf("failed to create script process: %s\n", e.message);
 			return null;
 		}
 
-		if (!p.get_successful()) {
-			stderr.printf("failed: child exited %d\n", p.get_if_signaled() ? 127 + p.get_term_sig() : p.get_exit_status());
+		proc.communicate_async.begin(null, this.cancellable, (obj, res) => {
+			try {
+				comm = proc.communicate_async.end(res, out ret, null);
+			} catch (Error e) {
+				stderr.printf("script communication failed: %s\n", e.message);
+				comm = false;
+			} finally {
+				this.conn.unregister_object(this.id);
+			}
+			Idle.add(this.run.callback);
+		});
+
+		yield;
+
+		if (!comm) {
+			stderr.printf("giving up: script communication failed...\n");
+			return null;
+		} else if (!proc.get_successful()) {
+			stderr.printf("failed: child exited %d\n", proc.get_if_signaled() ? 127 + proc.get_term_sig() : proc.get_exit_status());
 			return null;
 		}
 
 		stderr.printf("child successful!\n");
 
+		return ret;
+	}
+
+	public void close() throws DBusError, IOError {
+		this.cancellable.cancel();
+	}
+}
+
+public class FileRequest : ScriptRequest {
+
+	private bool multiple;
+
+	public FileRequest(bool save, HashTable<string, Variant> opts, ObjectPath h, DBusConnection conn) throws Error {
+		/* BUG: this.something segfaults until after base call */
+		bool multiple = false;
+		bool directory = false;
+		string? path = null;
+
+
+		opts.for_each((k, v) => {
+			if (k == "directory") {
+				directory = v.get_boolean();
+			} else if (k == "multiple") {
+				multiple = v.get_boolean();
+			} else if (k == "current_folder") {
+				path = (string)v.get_bytestring();
+			} else {
+				stderr.printf("ignoring key: %s\n", k);
+			}
+		});
+
+		string[] args = {
+			"env",
+			"SFM_MULTIPLE=" + to_one(multiple),
+			"SFM_DIRECTORY=" + to_one(directory),
+			"SFM_SAVE=" + to_one(save),
+			"SFM_PATH=" + (path ?? ""),
+			"xdp-sfm",
+		};
+
+		base(args, h, conn);
+		this.multiple = multiple;
+	}
+
+	public new async void run(out uint rep, out HashTable<string, Variant> results) throws Error {
+		results = new HashTable<string, Variant>(str_hash, str_equal);
+		Bytes? data = yield base.run();
+
+		if (data == null) {
+			rep = FAIL;
+			return;
+		}
+
+
 		Array<string> filenames = new Array<string>();
 		uint8[]? content = data.get_data();
-		if (content.length != 0) {
+		if (data.length != 0) {
 			size_t i = 0;
 			for (size_t j = 0; j < content.length; j++) {
 				if (content[j] == 0) {
 					string chosen = (string)content[i:];
 					try {
-						if (filenames.length == 0 || env.multiple) {
-							filenames.append_val(GLib.Filename.to_uri(chosen));
+						if (filenames.length == 0 || this.multiple) {
+							filenames.append_val(Filename.to_uri(chosen));
 						}
 					} catch (ConvertError e) {
 						stderr.printf("invalid file %s (%s)\n", chosen, e.message);
@@ -82,77 +137,82 @@ public class ScriptFileManager : Object {
 				stderr.printf("The last file in the list was not NUL-terminated\nYour script might need fixing!");
 			}
 		} else {
-			return null;
+			rep = FAIL;
+			return;
 		}
-		return filenames;
+
+		rep = OK;
+		results.insert("uris", filenames.data);
+	}
+}
+
+[DBus(name = "org.freedesktop.impl.portal.FileChooser")]
+public class ScriptFileManager : Object {
+
+	private DBusConnection conn;
+
+	public ScriptFileManager(DBusConnection conn) {
+		this.conn = conn;
 	}
 
-	ScriptEnv env_from_options(HashTable<string, Variant> opts) {
-		ScriptEnv ret = { false, false, null };
-		opts.for_each((k, v) => {
-			if (k == "directory") {
-				ret.directory = v.get_boolean();
-			} else if (k == "multiple") {
-				ret.multiple = v.get_boolean();
-			} else if (k == "current_folder") {
-				ret.path = (string)v.get_bytestring();
-			} else {
-				stderr.printf("ignoring key: %s\n", k);
-			}
-		});
-		return ret;
-	}
-
-	private void open_save(
+	private async void open_save(
 		bool save,
 		ObjectPath handle,
-		string app_id,
-		string parent_window,
-		string title,
 		HashTable<string, Variant> options,
 		out uint response,
 		out HashTable<string, Variant> results) throws DBusError, IOError {
 		/* begin */
-		ScriptEnv env = env_from_options(options);
-		results = new HashTable<string, Variant>(str_hash, str_equal);
-
+		FileRequest req;
 		try {
-			var req = new ScriptRequest(handle, this.conn);
-			Array<string> choice = launch_script(save, env);
-
-			if (choice == null || choice.length == 0) {
-				response = FAIL;
-			} else {
-				stderr.printf("ok, writing choices\n");
-				response = OK;
-				results.insert("uris", choice.data);
-			}
-			req.close();
+			req = new FileRequest(save, options, handle, this.conn);
 		} catch (Error e) {
+			stderr.printf("Failed to construct file request: %s\n", e.message);
 			response = FAIL;
+			results = new HashTable<string, Variant>(str_hash, str_equal);
+			return;
+		}
+
+		AsyncResult? outer_res = null;
+		req.run.begin((obj, res) => {
+			outer_res = res;
+			Idle.add(open_save.callback);
+		});
+
+		yield;
+
+		if (outer_res != null) {
+			try {
+				req.run.end(outer_res, out response, out results);
+			} catch(Error e) {
+				stderr.printf("request for file failed: %s\n", e.message);
+				response = FAIL;
+			}
+		} else {
+			response = ENDED;
+			results = new HashTable<string, Variant>(str_hash, str_equal);
 		}
 	}
 
-	public void open_file(
+	public async void open_file(
 		ObjectPath h,
-		string a,
-		string p,
-		string t,
+		string app_id,
+		string parent,
+		string title,
 		HashTable<string, Variant> o,
 		out uint rep,
 		out HashTable<string, Variant> res) throws DBusError, IOError {
-		open_save(false, h, a, p, t, o, out rep, out res);
+		yield open_save(false, h, o, out rep, out res);
 	}
 
-	public void save_file(
+	public async void save_file(
 		ObjectPath h,
-		string a,
-		string p,
-		string t,
+		string app_id,
+		string parent,
+		string title,
 		HashTable<string, Variant> o,
 		out uint rep,
 		out HashTable<string, Variant> res) throws DBusError, IOError {
-		open_save(true, h, a, p, t, o, out rep, out res);
+		yield open_save(true, h, o, out rep, out res);
 	}
 }
 
