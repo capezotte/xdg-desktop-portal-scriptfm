@@ -32,7 +32,9 @@ public class ScriptRequest : Object {
 
 		try {
 			proc = new Subprocess.newv(this.argv, SubprocessFlags.STDOUT_PIPE);
-			this.cancellable.connect(() => { proc.force_exit(); });
+			this.cancellable.connect(() => {
+				proc.send_signal(ProcessSignal.HUP);
+			});
 		} catch (Error e) {
 			stderr.printf("failed to create script process: %s\n", e.message);
 			return null;
@@ -99,7 +101,7 @@ public class FileRequest : ScriptRequest {
 			"SFM_DIRECTORY=" + to_one(directory),
 			"SFM_SAVE=" + to_one(save),
 			"SFM_PATH=" + (path ?? ""),
-			"xdp-sfm",
+			Environment.get_variable("SFM_FILE_SCRIPT") ?? "xdp-sfm",
 		};
 
 		base(args, h, conn);
@@ -108,37 +110,34 @@ public class FileRequest : ScriptRequest {
 
 	public new async void run(out uint rep, out HashTable<string, Variant> results) throws Error {
 		results = new HashTable<string, Variant>(str_hash, str_equal);
-		Bytes? data = yield base.run();
+		Bytes? data_raw = yield base.run();
 
-		if (data == null) {
+		if (data_raw == null || data_raw.length <= 1) {
 			rep = FAIL;
 			return;
 		}
 
+		/* ensure NUL termination */
+		var data = Bytes.unref_to_array(data_raw);
+		if (data.data[data.data.length-1] != 0) {
+			data.append({0});
+		}
 
 		Array<string> filenames = new Array<string>();
-		uint8[]? content = data.get_data();
-		if (data.length != 0) {
-			size_t i = 0;
-			for (size_t j = 0; j < content.length; j++) {
-				if (content[j] == 0) {
-					string chosen = (string)content[i:];
-					try {
-						if (filenames.length == 0 || this.multiple) {
-							filenames.append_val(Filename.to_uri(chosen));
-						}
-					} catch (ConvertError e) {
-						stderr.printf("invalid file %s (%s)\n", chosen, e.message);
+		uint8[]? content = data.data;
+		size_t i = 0;
+		for (size_t j = 0; j < content.length; j++) {
+			if (content[j] == 0) {
+				string chosen = (string)content[i:];
+				try {
+					if (filenames.length == 0 || this.multiple) {
+						filenames.append_val(Filename.to_uri(chosen));
 					}
-					i = j + 1;
+				} catch (ConvertError e) {
+					stderr.printf("invalid file %s (%s)\n", chosen, e.message);
 				}
+				i = j + 1;
 			}
-			if (i < content.length) {
-				stderr.printf("The last file in the list was not NUL-terminated\nYour script might need fixing!");
-			}
-		} else {
-			rep = FAIL;
-			return;
 		}
 
 		rep = OK;
