@@ -28,11 +28,13 @@ out="$XDG_RUNTIME_DIR/xdp-tfc-$$"
 cleanup() { kill -TERM "$WINDOW"; rm -f -- "$out"; }
 trap cleanup HUP EXIT
 
-
 # File the user should rename to save.
 # See contrib/ranger-wrapper on xdp-tfc for more details.
-if [ "$save" -eq 1 ] && [ ! -e "$path" ]; then
-	touch -- "$path"
+if [ "$save" -eq 1 ]; then
+	if [ "$directory" -ne 1 ] && [ -d "$path" ]; then
+		path="${path%/}/save"
+	fi
+	[ -e "$path" ] || touch -- "$path"
 fi
 
 # lf writes to two files, one the current directory and
@@ -61,7 +63,7 @@ wait
 # Same & WINDOW=$! in order to store the PID, and now wait "$WINDOW"
 # to get the exit code (i.e. know if yes or no was chosen).
 # Since lf writes NUL-terminated to the file, we need xargs -0.
-if [ "$save" -eq 1 ] && ! xargs -n1 -0 -- test ! -s < "$out"; then
+if [ "$save" -eq 1 ] && [ -s "$out" ] && ! xargs -n1 -0 -- test ! -s < "$out"; then
 	if zenity --question --text="The following files will be overwritten:
 
 $(xargs -0 printf '%s\n' < "$out")
