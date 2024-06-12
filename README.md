@@ -17,11 +17,10 @@ make VALAC=valac
 # Installing
 
 ```sh
-make DESTDIR=... PREFIX=/usr LIBEXECDIR=libexec install
+make DESTDIR=... PREFIX=/usr LIBEXECDIR=/usr/libexec install
 ```
 
-Note that some distributions expect `LIBEXECDIR=lib` (like Arch Linux).
-
+Note that some distributions expect `LIBEXECDIR=/usr/lib` (like Arch Linux).
 
 # Configuration
 
